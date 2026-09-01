@@ -10,6 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       bot:        { description: "Bot/profile name", required: true, default: "default" }
+      machine:    { description: "Target fleet: tasker-p1 (default) or designlab1 (relayed via peer)", required: false, default: "tasker-p1" }
       task:       { description: "Task prompt for the bot", required: true }
       deliver_to: { description: "Delivery target (bot-chat|all|platform:chat:id)", required: false, default: "" }
 
@@ -31,12 +32,18 @@ jobs:
           fi
 
           BOT="${{ github.event.inputs.bot || github.event.client_payload.bot || 'default' }}"
+          MACHINE="${{ github.event.inputs.machine || github.event.client_payload.machine || 'tasker-p1' }}"
           TASK="${{ github.event.inputs.task || github.event.client_payload.task || '' }}"
           DELIVER="${{ github.event.inputs.deliver_to || github.event.client_payload.deliver_to || '' }}"
 
           if [ -z "$TASK" ]; then
             echo "::error::No task provided."
             exit 1
+          fi
+
+          if [ "$MACHINE" = "designlab1" ]; then
+            RELAY_PREFIX="[PEER-RELAY to designlab1] Deliver this task to the designlab1 machine (hermes peer dm designlab1, or message_agent target=designlab1), wait for its reply, and report that reply verbatim as your answer. Task:"
+            TASK="${RELAY_PREFIX} ${TASK}"
           fi
 
           jq -n \
