@@ -5,3 +5,4 @@
 - 2026-09-01: loop-final — full Pattern B rehearsal (branch -> PR -> guarded auto-merge -> signed webhook callback).
 - 2026-09-01: loop-verified — signature fix validated (--data-binary + fail-loudly).
 - 2026-09-01: PAT verification push — scoped fine-grained token, bot identity.
+- 2026-09-01: PAT verification v2 — commit AND push under bot identity.
