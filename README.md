@@ -71,19 +71,30 @@ Also installed as a Hermes skill: `github:github-bot-runners` (shows up in
 
 ## Setup
 
-1. **Expose the gateway**
-   - API server (Pattern A/C): enable `platforms.api_server.enabled: true` and
-     set `API_SERVER_KEY` in `~/.hermes/.env`.
-   - Webhooks (Pattern B): run `hermes gateway setup`, or set
-     `WEBHOOK_ENABLED=true`, `WEBHOOK_PORT=8644`, `WEBHOOK_SECRET=...` — then
-     merge `config/hermes-webhook-route.yaml` into `config.yaml`.
-   - GitHub must be able to reach the webhook URL: use ngrok/cloudflared for a
-     home machine, or run the gateway on a VPS.
+1. **Expose the gateway — Tailscale Funnel (permanent, free, no domain)**
+
+   Funnel publishes fixed public URLs for the machine's tailnet name:
+   `https://<machine>.<tailnet>.ts.net` (→ API server) and `:8443` (→ webhooks).
+   URLs never rotate; no keeper daemon, no Cloudflare, no rate limits.
+
+   ```bash
+   tailscale funnel --bg 8642                                  # API server, port 443
+   tailscale funnel --bg --https 8443 http://127.0.0.1:8644    # webhooks
+   tailscale serve status                                      # verify both
+   ```
+
+   First-time enablement requires clicking the approval link Tailscale prints
+   (or visiting login.tailscale.com → Access Controls → nodeFunnel). After the
+   hostname's public DNS record appears (minutes), GitHub runners can reach it.
+   Funnel config persists across reboots — the daemon re-establishes it.
+
+   Alternative (rotating URL, needs a keeper): `cloudflared tunnel --url ...`
+   quick tunnels — see git history for the retired tunnel-keeper design.
+
 2. **Repo secrets** (repo → Settings → Secrets and variables → Actions):
-   - `HERMES_API_URL` — gateway API server base URL (`http://host:8377`)
+   - `HERMES_API_URL` — the funnel API URL (`https://<machine>.<tailnet>.ts.net`)
    - `HERMES_API_KEY` — the `API_SERVER_KEY` value (also used as webhook HMAC secret)
-3. **Optional repo variable** `RUNS_ON` — override the runner label
-   (defaults to `ubuntu-latest`; set `self-hosted` to route to your box).
+   - `HERMES_WEBHOOK_URL` — the funnel webhook URL (`https://<machine>.<tailnet>.ts.net:8443`)
 4. **Verify**
 
    ```bash
