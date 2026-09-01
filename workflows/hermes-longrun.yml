@@ -1,0 +1,49 @@
+name: Long Bot Job
+
+# For tasks that outlive the Actions runner: GitHub Actions boots a self-hosted
+# runner (or any VM you register — a cloud VM, an office box), hands it the
+# task, and reports back. Same trick thepopebot's upgrade workflow uses with
+# runs-on: self-hosted — GitHub's queue is the control plane; the box is the
+# muscle.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bot:   { description: "Bot/profile name", required: true }
+      task:  { description: "Task prompt", required: true }
+
+env:
+  HERMES_URL: ${{ secrets.HERMES_API_URL }}
+  HERMES_KEY: ${{ secrets.HERMES_API_KEY }}
+
+jobs:
+  long-run:
+    runs-on: [self-hosted, hermes-longrun]   # register a runner with these labels
+    timeout-minutes: 360                     # 6h ceiling
+
+    steps:
+      - name: Run bot task on the runner box
+        run: |
+          set -euo pipefail
+          BOT="${{ github.event.inputs.bot }}"
+          TASK="${{ github.event.inputs.task }}"
+
+          # If this box runs a local Hermes gateway, skip the HTTP hop:
+          #   hermes -p "$BOT" chat -q "$TASK"
+          # Otherwise call the gateway API from the runner box:
+          HTTP_CODE=$(curl -s -o /tmp/resp.txt -w '%{http_code}' -X POST \
+            "${HERMES_URL%/}/v1/chat/completions" \
+            -H "Authorization: Bearer ${HERMES_KEY}" \
+            -H "Content-Type: application/json" \
+            --max-time 3600 \
+            -d "$(jq -n --arg bot "$BOT" --arg task "$TASK" \
+              '{model: ("hermes-" + $bot),
+                messages: [{role: "user", content: $task}],
+                hermes_run_url: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}')")
+
+          echo "HTTP ${HTTP_CODE}"
+          head -c 2000 /tmp/resp.txt || true
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::error::Hermes returned HTTP ${HTTP_CODE}"
+            exit 1
+          fi

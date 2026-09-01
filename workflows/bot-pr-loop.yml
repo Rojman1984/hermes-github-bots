@@ -1,0 +1,127 @@
+name: Bot PR Loop
+
+# Closes the loop thepopebot-style: when a bot's PR opens, GitHub Actions
+# auto-merges it (if AUTO_MERGE != 'false' and paths are allowed), then a
+# second workflow POSTs a completion payload back to Hermes. The payload
+# arrives on your webhook routes / bot chats as the agent-visible event.
+
+on:
+  pull_request:
+    types: [opened]
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  HERMES_URL: ${{ secrets.HERMES_API_URL }}
+  HERMES_KEY: ${{ secrets.HERMES_API_KEY }}
+
+jobs:
+  auto-merge:
+    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
+    if: startsWith(github.event.pull_request.head.ref, 'bot/')
+    timeout-minutes: 15
+    steps:
+      - name: Wait for mergeability, check guardrails, merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PR="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+
+          # 1. Wait for GitHub to compute mergeability (like thepopebot)
+          MERGEABLE="UNKNOWN"
+          for i in $(seq 1 30); do
+            sleep 10
+            MERGEABLE=$(gh pr view "$PR" --repo "$REPO" --json mergeable -q '.mergeable')
+            [ -n "$MERGEABLE" ] && [ "$MERGEABLE" != "UNKNOWN" ] && break
+          done
+          [ "$MERGEABLE" = "MERGEABLE" ] || { echo "Not mergeable: $MERGEABLE"; exit 0; }
+
+          # 2. AUTO_MERGE guardrail
+          if [ "${{ vars.AUTO_MERGE }}" = "false" ]; then
+            echo "AUTO_MERGE=false — skipping merge."
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            MERGEABLE="SKIPPED"
+          fi
+
+          # 3. ALLOWED_PATHS guardrail (comma-separated prefixes, '/' = all)
+          if [ "$MERGEABLE" = "MERGEABLE" ]; then
+            ALLOWED_PATHS="${{ vars.ALLOWED_PATHS }}"
+            [ -z "$ALLOWED_PATHS" ] && ALLOWED_PATHS="/"   # default: everything allowed
+            CHANGED=$(gh pr diff "$PR" --name-only --repo "$REPO")
+            ALL_OK=true
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              FILE_OK=false
+              IFS=',' read -ra PREFIXES <<< "$ALLOWED_PATHS"
+              for p in "${PREFIXES[@]}"; do
+                t="$(echo "$p" | xargs)"
+                [ -z "$t" ] && continue
+                case "$t" in /*) t="${t#/}" ;; esac
+                case "$f" in "$t"*) FILE_OK=true; break ;; esac
+              done
+              [ "$FILE_OK" = "false" ] && { echo "BLOCKED: $f"; ALL_OK=false; }
+            done <<< "$CHANGED"
+
+            if [ "$ALL_OK" = "true" ]; then
+              gh pr merge "$PR" --squash --delete-branch --repo "$REPO"
+              echo "merged=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "merged=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+  notify-hermes:
+    needs: auto-merge
+    if: always()
+    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    steps:
+      - name: POST completion back to Hermes
+        run: |
+          set -euo pipefail
+          if [ -z "${HERMES_URL}" ] || [ -z "${HERMES_KEY}" ]; then
+            echo "::error::Set HERMES_API_URL and HERMES_API_KEY repo secrets first."
+            exit 1
+          fi
+
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          BOT="${BRANCH#bot/}"; BOT="${BOT%%/*}"    # bot/<bot>/<task-slug>
+          PR="${{ github.event.pull_request.number }}"
+
+          MERGED=$([ "${{ needs.auto-merge.outputs.merged }}" = "true" ] && echo true || echo false)
+          if [ "$MERGED" = "true" ]; then STATUS="completed"; else STATUS="needs_attention"; fi
+
+          jq -n \
+            --arg bot "$BOT" \
+            --arg pr "$PR" \
+            --arg branch "$BRANCH" \
+            --arg status "$STATUS" \
+            --arg title "${{ github.event.pull_request.title }}" \
+            --arg url "${{ github.event.pull_request.html_url }}" \
+            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{hermes_event: "github_pr_complete",
+              bot: $bot,
+              pr_number: $pr,
+              branch: $branch,
+              status: $status,
+              pr_title: $title,
+              pr_url: $url,
+              run_url: $run_url,
+              merged: $merged}' > payload.json
+
+          HERMES_SIG="sha256=$(openssl dgst -sha256 -hmac "${HERMES_KEY}" -r payload.json | cut -d' ' -f1)"
+          HTTP_CODE=$(curl -s -o /tmp/resp.txt -w '%{http_code}' -X POST \
+            "${HERMES_URL%/}/webhooks/github-bot-pr" \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-Event: bot_pr_complete" \
+            -H "X-Hub-Signature-256: ${HERMES_SIG}" \
+            --max-time 60 \
+            -d @payload.json)
+
+          echo "HTTP ${HTTP_CODE}"
+          head -c 2000 /tmp/resp.txt || true

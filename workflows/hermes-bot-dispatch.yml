@@ -1,0 +1,64 @@
+name: Dispatch Hermes Bot
+
+# Fire-and-forget dispatch of a job to a Hermes Bot profile. The bot runs on
+# your machine (or any gateway reachable from it); this workflow only costs
+# ~1-2 Actions minutes to kick it off.
+
+on:
+  repository_dispatch:
+    types: [hermes-bot-run]
+  workflow_dispatch:
+    inputs:
+      bot:        { description: "Bot/profile name", required: true, default: "default" }
+      task:       { description: "Task prompt for the bot", required: true }
+      deliver_to: { description: "Delivery target (bot-chat|all|platform:chat:id)", required: false, default: "" }
+
+env:
+  HERMES_URL: ${{ secrets.HERMES_API_URL }}     # e.g. http://your-host:8377
+  HERMES_KEY: ${{ secrets.HERMES_API_KEY }}     # API_SERVER_KEY
+
+jobs:
+  dispatch:
+    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    steps:
+      - name: Dispatch to Hermes
+        run: |
+          set -euo pipefail
+          if [ -z "${HERMES_URL}" ] || [ -z "${HERMES_KEY}" ]; then
+            echo "::error::Set HERMES_API_URL and HERMES_API_KEY repo secrets first."
+            exit 1
+          fi
+
+          BOT="${{ github.event.inputs.bot || github.event.client_payload.bot || 'default' }}"
+          TASK="${{ github.event.inputs.task || github.event.client_payload.task || '' }}"
+          DELIVER="${{ github.event.inputs.deliver_to || github.event.client_payload.deliver_to || '' }}"
+
+          if [ -z "$TASK" ]; then
+            echo "::error::No task provided."
+            exit 1
+          fi
+
+          jq -n \
+            --arg bot "$BOT" \
+            --arg task "$TASK" \
+            --arg deliver "$DELIVER" \
+            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{model: ("hermes-" + $bot),
+              messages: [{role: "user", content: $task}],
+              hermes_deliver: (if $deliver == "" then null else $deliver end),
+              hermes_run_url: $run_url}' > payload.json
+
+          HTTP_CODE=$(curl -s -o /tmp/resp.txt -w '%{http_code}' -X POST \
+            "${HERMES_URL%/}/v1/chat/completions" \
+            -H "Authorization: Bearer ${HERMES_KEY}" \
+            -H "Content-Type: application/json" \
+            --max-time 540 \
+            -d @payload.json)
+
+          echo "HTTP ${HTTP_CODE}"
+          head -c 2000 /tmp/resp.txt || true
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::error::Hermes returned HTTP ${HTTP_CODE}"
+            exit 1
+          fi

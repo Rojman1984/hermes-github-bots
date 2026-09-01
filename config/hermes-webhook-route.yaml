@@ -1,0 +1,63 @@
+# Hermes gateway config snippet — inbound GitHub events → agent runs.
+# Merge the platforms.webhook block into the target profile's ~/.hermes/config.yaml
+# (or ~/.hermes/profiles/<bot>/config.yaml when using multiplex_profiles).
+#
+# Enable + verify:
+#   hermes gateway setup          # wizard: enable webhooks, port, global secret
+#   hermes webhook list           # confirm routes registered
+#   curl http://localhost:8644/health
+#
+# Signature contract (validated by gateway/platforms/webhook.py):
+#   GitHub-native:  X-Hub-Signature-256: sha256=<hex hmac-sha256(secret, raw_body)>
+#   Generic V2:     X-Webhook-Signature-V2: <hex hmac-sha256(secret, "<unix_ts>.<raw_body>")>
+#                   X-Webhook-Timestamp: <unix seconds>  (±300s window)
+#   Event routing:  X-GitHub-Event header, or an event_type field in the JSON body.
+
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      port: 8644
+      secret: "CHANGE_ME_global_fallback_secret"
+      routes:
+
+        # Completion callbacks from the bot-pr-loop.yml workflow.
+        # Runs on this profile's agent; results go to your home channel.
+        github-bot-pr:
+          events: ["bot_pr_complete"]
+          secret: "CHANGE_ME_route_secret"      # must match GH secret HERMES_API_KEY
+          prompt: |
+            GitHub bot-run completed:
+            PR #{pr_number} "{pr_title}" — status: {status}
+            Branch: {branch}
+            PR: {pr_url}
+            Run log: {run_url}
+            Merged: {merged}
+            Summarize the outcome and note anything that needs follow-up.
+          deliver: "log"                         # or: telegram / discord / slack …
+          # deliver_extra:
+          #   chat_id: "123456789"
+
+        # GitHub-native events, filtered declaratively. Example: an issue
+        # labeled "hermes" wakes the agent; everything else is ignored.
+        github-issues:
+          events: ["issues"]
+          secret: "CHANGE_ME_route_secret"
+          filters:
+            - field: "action"
+              equals: "opened"
+            - field: "issue.labels"
+              contains: "hermes"
+          prompt: |
+            New GitHub issue #{issue.number} in {repository.full_name}: {issue.title}
+            Author: {issue.user.login}
+            Body:
+            {issue.body}
+            Triage it: assess scope, propose an approach, and draft a reply comment.
+          deliver: "log"
+
+# Advanced: to run inbound events AS a specific Bot (not the default profile),
+# enable profile multiplexing and add `profile: <bot>` to the route — the URL
+# becomes /p/<bot>/webhooks/<route> and the run uses that Bot's skills/memory.
+# gateway:
+#   multiplex_profiles: true
