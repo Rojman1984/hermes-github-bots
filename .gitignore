@@ -1,0 +1,4 @@
+# local test scaffolding & secrets — never commit
+.test/
+.env
+*.key
