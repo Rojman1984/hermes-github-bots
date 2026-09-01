@@ -106,6 +106,7 @@ jobs:
             --arg title "${{ github.event.pull_request.title }}" \
             --arg url "${{ github.event.pull_request.html_url }}" \
             --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg merged "$MERGED" \
             '{hermes_event: "github_pr_complete",
               bot: $bot,
               pr_number: $pr,
