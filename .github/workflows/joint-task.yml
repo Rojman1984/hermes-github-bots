@@ -1,0 +1,136 @@
+name: Joint Task (Cross-Machine)
+
+# Two-fleet pipeline: tasker-p1 GENERATES a dataset, hands the raw deliverable
+# to designlab1 (via peer relay) which PARSES it; the workflow then publishes
+# both deliverables to a bot/joint/* branch — bot-pr-loop merges it and the
+# signed callback notifies the gateway. Exercises the full loop end to end.
+
+on:
+  workflow_dispatch:
+    inputs:
+      topic: { description: "Dataset topic", required: true }
+      rows:  { description: "Rows to generate (3-12)", required: false, default: "6" }
+
+env:
+  HERMES_URL: ${{ secrets.HERMES_API_URL }}
+  HERMES_KEY: ${{ secrets.HERMES_API_KEY }}
+
+jobs:
+  generate:
+    name: "1/3 generate (tasker-p1)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      dataset_b64: ${{ steps.gen.outputs.dataset_b64 }}
+    steps:
+      - name: Ask tasker-p1 bot to generate the dataset
+        id: gen
+        run: |
+          set -euo pipefail
+          jq -n --arg task "Generate a CSV dataset about: ${{ github.event.inputs.topic }}. Exactly ${{ github.event.inputs.rows }} data rows plus a header. Columns: name,category,value,notes. Output ONLY the raw CSV in a single fenced code block, no commentary." \
+            '{model: "hermes-default",
+              messages: [{role: "user", content: $task}]}' > payload.json
+
+          HTTP_CODE=$(curl -s -o /tmp/resp.json -w '%{http_code}' -X POST \
+            "${HERMES_URL%/}/v1/chat/completions" \
+            -H "Authorization: Bearer ${HERMES_KEY}" \
+            -H "Content-Type: application/json" \
+            --max-time 540 \
+            -d @payload.json)
+          echo "HTTP $HTTP_CODE"
+          [ "$HTTP_CODE" -lt 400 ] || { cat /tmp/resp.json; exit 1; }
+
+          # extract the reply and encode for safe cross-job transfer
+          jq -r '.choices[0].message.content' /tmp/resp.json > dataset.md
+          echo "--- dataset (first 400 chars) ---"
+          head -c 400 dataset.md
+          B64=$(base64 -w0 dataset.md)
+          echo "dataset_b64=$B64" >> "$GITHUB_OUTPUT"
+
+  parse:
+    name: "2/3 parse (designlab1 via peer relay)"
+    runs-on: ubuntu-latest
+    needs: generate
+    timeout-minutes: 20
+    outputs:
+      analysis_b64: ${{ steps.parse.outputs.analysis_b64 }}
+    steps:
+      - name: Ask designlab1 (relayed through tasker-p1) to parse the dataset
+        id: parse
+        run: |
+          set -euo pipefail
+          echo "${{ needs.generate.outputs.dataset_b64 }}" | base64 -d > dataset.md
+
+          # relay wrapper: the tasker-p1 gateway forwards this to designlab1
+          TASK="[PEER-RELAY to designlab1] Deliver this task to the designlab1 machine (hermes peer dm designlab1, or message_agent target=designlab1), wait for its reply, and report that reply verbatim as your answer. Task: Parse the following CSV dataset. Compute: total row count, count per category, min/max/mean of the value column. Then write a 3-bullet insight summary. Reply with a markdown report only.
+
+          ${{ github.event.inputs.topic }} dataset:
+          $(cat dataset.md)"
+
+          HTTP_CODE=$(curl -s -o /tmp/resp.json -w '%{http_code}' -X POST \
+            "${HERMES_URL%/}/v1/chat/completions" \
+            -H "Authorization: Bearer ${HERMES_KEY}" \
+            -H "Content-Type: application/json" \
+            --max-time 540 \
+            -d "$(jq -n --arg task "$TASK" \
+              '{model: "hermes-default", messages: [{role: "user", content: $task}]}')")
+          echo "HTTP $HTTP_CODE"
+          [ "$HTTP_CODE" -lt 400 ] || { cat /tmp/resp.json; exit 1; }
+
+          jq -r '.choices[0].message.content' /tmp/resp.json > analysis.md
+          echo "--- analysis (first 400 chars) ---"
+          head -c 400 analysis.md
+          B64=$(base64 -w0 analysis.md)
+          echo "analysis_b64=$B64" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: "3/3 publish PR with both deliverables"
+    runs-on: ubuntu-latest
+    needs: parse
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write deliverables and open PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BR="bot/joint/run-${{ github.run_id }}"
+          STAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          mkdir -p docs/joint
+          {
+            echo "# Joint task — ${{ github.event.inputs.topic }}"
+            echo ""
+            echo "Pipeline: tasker-p1 (generate) → designlab1 (parse) → this PR"
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "Completed: $STAMP"
+            echo ""
+            echo "## Dataset (generated on tasker-p1)"
+            echo ""
+            echo "${{ needs.generate.outputs.dataset_b64 }}" | base64 -d
+            echo ""
+            echo "## Analysis (parsed on designlab1)"
+            echo ""
+            echo "${{ needs.parse.outputs.analysis_b64 }}" | base64 -d
+          } > "docs/joint/${{ github.run_id }}.md"
+
+          git config user.name "hermes-bot[bot]"
+          git config user.email "hermes-bot@users.noreply.github.com"
+          git checkout -b "$BR"
+          git add docs/joint
+          git commit -m "bot(joint): ${{ github.event.inputs.topic }} — tasker-p1 generated, designlab1 parsed"
+          git push origin "$BR"
+
+          gh pr create --repo "${{ github.repository }}" \
+            --base main --head "$BR" \
+            --title "bot(joint): ${{ github.event.inputs.topic }}" \
+            --body "Cross-machine joint task.
+          - Stage 1 (tasker-p1): dataset generation
+          - Stage 2 (designlab1, via peer relay): parsing + insights
+          - Stage 3 (this workflow): publishing both deliverables
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "PR opened from $BR — bot-pr-loop will merge and call back"
