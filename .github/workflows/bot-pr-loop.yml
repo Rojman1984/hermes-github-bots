@@ -124,7 +124,11 @@ jobs:
             -H "X-GitHub-Event: bot_pr_complete" \
             -H "X-Hub-Signature-256: ${HERMES_SIG}" \
             --max-time 60 \
-            -d @payload.json)
+            --data-binary @payload.json)
 
           echo "HTTP ${HTTP_CODE}"
           head -c 2000 /tmp/resp.txt || true
+          if [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::Hermes webhook returned HTTP ${HTTP_CODE}"
+            exit 1
+          fi
