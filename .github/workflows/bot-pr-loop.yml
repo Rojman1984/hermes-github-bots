@@ -17,6 +17,7 @@ permissions:
 env:
   HERMES_URL: ${{ secrets.HERMES_API_URL }}
   HERMES_KEY: ${{ secrets.HERMES_API_KEY }}
+  HERMES_WEBHOOK_URL: ${{ secrets.HERMES_WEBHOOK_URL }}
 
 jobs:
   auto-merge:
@@ -82,11 +83,12 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: POST completion back to Hermes
+        if: env.HERMES_WEBHOOK_URL != ''
         run: |
           set -euo pipefail
-          if [ -z "${HERMES_URL}" ] || [ -z "${HERMES_KEY}" ]; then
-            echo "::error::Set HERMES_API_URL and HERMES_API_KEY repo secrets first."
-            exit 1
+          if [ -z "${HERMES_WEBHOOK_URL}" ]; then
+            echo "HERMES_WEBHOOK_URL not set — skipping callback"
+            exit 0
           fi
 
           BRANCH="${{ github.event.pull_request.head.ref }}"
@@ -116,7 +118,7 @@ jobs:
 
           HERMES_SIG="sha256=$(openssl dgst -sha256 -hmac "${HERMES_KEY}" -r payload.json | cut -d' ' -f1)"
           HTTP_CODE=$(curl -s -o /tmp/resp.txt -w '%{http_code}' -X POST \
-            "${HERMES_URL%/}/webhooks/github-bot-pr" \
+            "${HERMES_WEBHOOK_URL%/}/webhooks/github-bot-pr" \
             -H "Content-Type: application/json" \
             -H "X-GitHub-Event: bot_pr_complete" \
             -H "X-Hub-Signature-256: ${HERMES_SIG}" \
