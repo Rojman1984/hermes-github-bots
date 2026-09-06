@@ -55,7 +55,7 @@ jobs:
             --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --arg log_url "${{ github.server_url }}/${{ github.repository }}/blob/main/logs/dispatches/$(date -u +%F)/run-${{ github.run_id }}.md" \
             '{model: ("hermes-" + $bot),
-              messages: [{role: "user", content: ($task + "\n\n[GITHUB-CHECKPOINTS] run: " + $run_url + " | log (appears ~1 min after completion): " + $log_url)]},
+              messages: [{role: "user", content: ($task + "\n\n[GITHUB-CHECKPOINTS] run: " + $run_url + " | log (appears ~1 min after completion): " + $log_url)}],
               hermes_deliver: (if $deliver == "" then null else $deliver end),
               hermes_run_url: $run_url}' > payload.json
 
