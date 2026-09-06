@@ -90,11 +90,15 @@ jobs:
           GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # retry loop: rebase and retry push if another run committed first
+          git init -q /tmp/fleetrepo
+          cd /tmp/fleetrepo
+          git config user.name  "hermes-bot[bot]"
+          git config user.email "hermes-bot@users.noreply.github.com"
+          # retry loop: pull-rebase and retry push if another run committed first
           for ATTEMPT in 1 2 3; do
-            git config user.name  "hermes-bot[bot]"
-            git config user.email "hermes-bot@users.noreply.github.com"
-            git pull --rebase origin main >/dev/null 2>&1 || true
+            git remote add origin "https://x-access-token:${BOT_TOKEN}@github.com/${REPO}.git" 2>/dev/null || true
+            git fetch -q origin main 2>/dev/null || { echo "::error::fetch failed"; exit 1; }
+            git checkout -q -b work origin/main
 
             DAY=$(date -u +%F); NOW=$(date -u +%FT%TZ)
             RUN="${{ github.run_id }}"
@@ -138,7 +142,7 @@ jobs:
 
             git add logs/dispatches data/usage
             git commit -m "bot(dispatch): log run $RUN ($BOT, ${TT} tokens)" >/dev/null
-            if git push "https://x-access-token:${BOT_TOKEN}@github.com/${REPO}.git" HEAD:main >/dev/null 2>&1; then
+            if git push -q origin HEAD:main 2>/dev/null; then
               echo "Recorded: $F (+usage ledger)"
               break
             fi
