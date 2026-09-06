@@ -1,5 +1,5 @@
 name: Dispatch Hermes Bot
-true:
+on:
   repository_dispatch:
     types:
     - hermes-bot-run
