@@ -1,0 +1,48 @@
+# hermes-gw — the fleet's production gateway
+#
+# Two services sharing one network namespace:
+#   gw : official nousresearch/hermes-agent image, gateway mode, s6-supervised.
+#        Hosts ALL bot profiles (each profile = its own supervised service).
+#   ts : tailscale sidecar owning the DEDICATED node identity "hermes-gw".
+#        Publishes the funnel (public URLs) and tailnet exposure.
+#
+# The funnel URLs belong to this stack, not to any machine:
+#   https://hermes-gw.<tailnet>.ts.net       -> API server  (8642)
+#   https://hermes-gw.<tailnet>.ts.net:8443  -> webhooks    (8644)
+#
+# Secrets come from .env next to this file (never committed):
+#   TS_AUTHKEY      tailscale pre-auth key minting the hermes-gw node (one-time)
+#   HERMES_UID/GID  host uid/gid for volume ownership (tasker0 on tasker-p1)
+
+services:
+  ts:
+    image: tailscale/tailscale:latest
+    container_name: hermes-gw-ts
+    restart: unless-stopped
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY:?mint one at login.tailscale.com/admin/settings/keys}
+      - TS_HOSTNAME=hermes-gw
+      - TS_STATE_DIR=/state
+      - TS_SERVE_CONFIG=/config/serve.json
+      - TS_USERSPACE=true
+    volumes:
+      - ./ts-state:/state          # node identity persists across redeploys
+      - ./serve.json:/config/serve.json:ro
+    healthcheck:
+      test: ["CMD", "tailscale", "status", "--peers=false"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  gw:
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:latest}
+    container_name: hermes-gw
+    restart: unless-stopped
+    mem_limit: 4g
+    cpus: 2
+    network_mode: "service:ts"     # share ts's netns so funnel reaches 127.0.0.1:8642/8644
+    environment:
+      - HERMES_UID=${HERMES_UID:-1000}
+      - HERMES_GID=${HERMES_GID:-1000}
+    volumes:
+      - ./data:/opt/data           # config.yaml, .env, profiles/, sessions, memory
