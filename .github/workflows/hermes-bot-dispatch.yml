@@ -74,7 +74,7 @@ jobs:
           HTTP_CODE=$(curl -s -o /tmp/resp.txt -w '%{http_code}' -X POST \
             "${HERMES_URL%/}${ROUTE}/v1/chat/completions" \
             -H "Authorization: Bearer ${BOTKEY}" \
-            -H "X-Hermes-Session-Id: fleet-${BOT}" \
+            -H "X-Hermes-Session-Id: fleet-${BOT}${ROUTE:+-local}" \
             -H "Content-Type: application/json" \
             --max-time 540 \
             -d @payload.json)
