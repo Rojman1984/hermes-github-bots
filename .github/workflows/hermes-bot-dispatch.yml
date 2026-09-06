@@ -103,11 +103,6 @@ jobs:
             git fetch -q origin main 2>/dev/null || { echo "::error::fetch failed"; exit 1; }
             git checkout -q -b work origin/main
 
-            # provider/model ground truth from the container's session store
-            SID=$(jq -r '.id // "fleet-'$BOT'"' /tmp/resp.txt 2>/dev/null || echo "fleet-$BOT")
-            read -r SMODEL SPROVIDER SBASEURL < <(curl -s -m 15 -X POST \
-              "https://hermes-gw.tail68295e.ts.net" >/dev/null 2>&1; \
-              docker -H unix:///nonexistent 2>/dev/null; echo "") || true
             RUN="${{ github.run_id }}"
             BOT=$(jq -r '.bot // ""' /tmp/fleetlog/meta.json)
             MACHINE=$(jq -r '.machine // ""' /tmp/fleetlog/meta.json)
@@ -116,21 +111,30 @@ jobs:
             PT=$(jq -r '.usage.prompt_tokens // 0' /tmp/fleetlog/api_meta.json)
             CT=$(jq -r '.usage.completion_tokens // 0' /tmp/fleetlog/api_meta.json)
             TT=$(jq -r '.usage.total_tokens // 0' /tmp/fleetlog/api_meta.json)
-
-            # provider/model ground truth: model from the session store,
-            # provider/base_url from the container's config (via SSH-free
-            # path: the dispatch session response + container .env knowledge
-            # is baked in at deploy time — but the durable source is the
-            # session API's model + the known provider config)
-            SID=$(jq -r '.id // "fleet-'"$BOT"'"' /tmp/resp.txt 2>/dev/null || true)
+            # provider/model ground truth (from the gateway session API)
+            SID=$(jq -r '.id // "fleet-\($bot)"' --arg bot "$BOT" /tmp/resp.txt 2>/dev/null || echo "fleet-$BOT")
             [ -n "$SID" ] || SID="fleet-$BOT"
             SESSION_JSON=$(curl -s -m 20 "${HERMES_URL%/}/api/sessions/$SID" \
               -H "Authorization: Bearer ${HERMES_KEY}" || echo '{}')
             SMODEL=$(echo "$SESSION_JSON" | jq -r '.session.model // ""')
-            # provider/base_url: read from the repo's deploy config (single
-            # source of truth for the hermes-gw stack)
-            SPROVIDER="custom"
+            SPROVIDER="custom"            # hermes-gw stack provider (deploy/hermes-gw)
             SBASEURL="https://ollama.com/v1"
+                        BOT=$(jq -r '.bot // ""' /tmp/fleetlog/meta.json)
+                        MACHINE=$(jq -r '.machine // ""' /tmp/fleetlog/meta.json)
+                        TASK=$(jq -r '.task // ""' /tmp/fleetlog/meta.json)
+                        MODEL=$(jq -r '.model // "n/a"' /tmp/fleetlog/api_meta.json)
+                        PT=$(jq -r '.usage.prompt_tokens // 0' /tmp/fleetlog/api_meta.json)
+                        CT=$(jq -r '.usage.completion_tokens // 0' /tmp/fleetlog/api_meta.json)
+                        TT=$(jq -r '.usage.total_tokens // 0' /tmp/fleetlog/api_meta.json)
+                        # provider/model ground truth (from the gateway session API)
+                        SID=$(jq -r '.id // "fleet-\\($bot)"' --arg bot "$BOT" /tmp/resp.txt 2>/dev/null || echo "fleet-$BOT")
+                        [ -n "$SID" ] || SID="fleet-$BOT"
+                        SESSION_JSON=$(curl -s -m 20 "${HERMES_URL%/}/api/sessions/$SID" \
+                          -H "Authorization: Bearer ${HERMES_KEY}" || echo '{}')
+                        SMODEL=$(echo "$SESSION_JSON" | jq -r '.session.model // ""')
+                        SPROVIDER="custom"            # hermes-gw stack provider (deploy/hermes-gw)
+                        SBASEURL="https://ollama.com/v1"
+
 
             # 1. human-readable log
             F="logs/dispatches/$DAY/run-$RUN.md"
