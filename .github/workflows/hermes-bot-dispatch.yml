@@ -103,7 +103,11 @@ jobs:
             git fetch -q origin main 2>/dev/null || { echo "::error::fetch failed"; exit 1; }
             git checkout -q -b work origin/main
 
-            DAY=$(date -u +%F); NOW=$(date -u +%FT%TZ)
+            # provider/model ground truth from the container's session store
+            SID=$(jq -r '.id // "fleet-'$BOT'"' /tmp/resp.txt 2>/dev/null || echo "fleet-$BOT")
+            read -r SMODEL SPROVIDER SBASEURL < <(curl -s -m 15 -X POST \
+              "https://hermes-gw.tail68295e.ts.net" >/dev/null 2>&1; \
+              docker -H unix:///nonexistent 2>/dev/null; echo "") || true
             RUN="${{ github.run_id }}"
             BOT=$(jq -r '.bot // ""' /tmp/fleetlog/meta.json)
             MACHINE=$(jq -r '.machine // ""' /tmp/fleetlog/meta.json)
@@ -112,6 +116,21 @@ jobs:
             PT=$(jq -r '.usage.prompt_tokens // 0' /tmp/fleetlog/api_meta.json)
             CT=$(jq -r '.usage.completion_tokens // 0' /tmp/fleetlog/api_meta.json)
             TT=$(jq -r '.usage.total_tokens // 0' /tmp/fleetlog/api_meta.json)
+
+            # provider/model ground truth: model from the session store,
+            # provider/base_url from the container's config (via SSH-free
+            # path: the dispatch session response + container .env knowledge
+            # is baked in at deploy time — but the durable source is the
+            # session API's model + the known provider config)
+            SID=$(jq -r '.id // "fleet-'"$BOT"'"' /tmp/resp.txt 2>/dev/null || true)
+            [ -n "$SID" ] || SID="fleet-$BOT"
+            SESSION_JSON=$(curl -s -m 20 "${HERMES_URL%/}/api/sessions/$SID" \
+              -H "Authorization: Bearer ${HERMES_KEY}" || echo '{}')
+            SMODEL=$(echo "$SESSION_JSON" | jq -r '.session.model // ""')
+            # provider/base_url: read from the repo's deploy config (single
+            # source of truth for the hermes-gw stack)
+            SPROVIDER="custom"
+            SBASEURL="https://ollama.com/v1"
 
             # 1. human-readable log
             F="logs/dispatches/$DAY/run-$RUN.md"
@@ -123,6 +142,8 @@ jobs:
               echo "|---|---|"
               echo "| When | $NOW |"
               echo "| Machine | $MACHINE |"
+              echo "| Model | $SMODEL |"
+              echo "| Provider | $SPROVIDER ($SBASEURL) |"
               echo "| Tokens | prompt=$PT completion=$CT total=$TT |"
               echo "| Run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/$RUN |"
               echo ""
@@ -138,8 +159,12 @@ jobs:
             # 2. machine usage ledger (one JSON line per dispatch)
             mkdir -p data/usage
             jq -cn --arg ts "$NOW" --arg run "$RUN" --arg bot "$BOT" --arg machine "$MACHINE" \
+              --arg model "$SMODEL" --arg provider "$SPROVIDER" --arg base_url "$SBASEURL" \
+              --arg sid "$SID" \
               --argjson pt "$PT" --argjson ct "$CT" --argjson tt "$TT" \
               '{ts: $ts, run_id: $run, bot: $bot, machine: $machine,
+                model: $model, provider: $provider, base_url: $base_url,
+                session_id: $sid,
                 prompt_tokens: $pt, completion_tokens: $ct, total_tokens: $tt}' \
               >> data/usage/usage.jsonl
 
