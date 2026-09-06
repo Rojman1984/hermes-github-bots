@@ -121,16 +121,15 @@ jobs:
             TT=$(jq -r '.usage.total_tokens // 0' /tmp/fleetlog/api_meta.json)
             # provider/model ground truth: session id is ours by construction
             SID="fleet-${BOT}"
+            ROUTE="${ROUTE:-}"
+            case "$BOT" in
+              scout)  SPROVIDER="ollama-local"; SBASEURL="http://172.24.0.1:11434/v1 (tasker-p1 iGPU)" ;;
+              scribe) SPROVIDER="ollama-local"; SBASEURL="http://172.24.0.1:11434/v1 (tasker-p1 iGPU)" ;;
+              *)      SPROVIDER="custom";       SBASEURL="https://ollama.com/v1" ;;
+            esac
             SESSION_JSON=$(curl -s -m 20 "${HERMES_URL%/}${ROUTE}/api/sessions/$SID" \
-              -H "Authorization: Bearer ${BOTKEY}" || echo '{}')
+              -H "Authorization: Bearer ${BOTKEY:-${HERMES_KEY}}" || echo '{}')
             SMODEL=$(echo "$SESSION_JSON" | jq -r '.session.model // "unknown"')
-            if [ -n "$ROUTE" ]; then
-              SPROVIDER="ollama-local"
-              SBASEURL="http://172.24.0.1:11434/v1 (tasker-p1 iGPU)"
-            else
-              SPROVIDER="custom"
-              SBASEURL="https://ollama.com/v1"
-            fi
 
             F="logs/dispatches/$DAY/run-$RUN.md"
             mkdir -p "$(dirname "$F")"
