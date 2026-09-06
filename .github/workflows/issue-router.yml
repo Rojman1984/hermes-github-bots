@@ -1,0 +1,109 @@
+name: Issue Router
+
+# The swarm's state machine (thepopebot Cluster Mode pattern, adapted):
+#   - an issue labeled `task` is a work order for the fleet
+#   - the issue body's first line after a `bot:` directive selects the bot
+#     (default: `default` profile)
+#   - the router dispatches the task through the production funnel, posts the
+#     bot's result as an issue comment, and closes the issue
+#   - `incident`-labeled issues are NOT routed — they belong to Sentinel's
+#     health loop (auto-closed after 2h clean checks)
+#
+# Human workflow: open an issue describing a task, add the `task` label.
+# The fleet picks it up; the whole lifecycle is auditable on the issue.
+
+on:
+  issues:
+    types: [labeled]
+
+concurrency:
+  group: issue-router-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  issues: write
+
+env:
+  HERMES_URL: ${{ secrets.HERMES_API_URL }}
+  HERMES_KEY: ${{ secrets.HERMES_API_KEY }}
+  REPO: Rojman1984/hermes-github-bots
+
+jobs:
+  route:
+    # only fire for the `task` label (not incident, not anything else)
+    if: github.event.label.name == 'task' && github.event.action == 'labeled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Extract task + bot from issue
+        id: parse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NUM="${{ github.event.issue.number }}"
+          BODY=$(gh issue view "$NUM" --repo "$REPO" --json body -q .body)
+          # first line starting with "bot:" names the profile; default otherwise
+          BOT=$(echo "$BODY" | grep -m1 -oE '^bot:[[:alnum:]_-]+' | cut -d: -f2 || true)
+          [ -n "$BOT" ] || BOT=default
+          # strip any leading directive lines to form the task text
+          TASK=$(echo "$BODY" | sed '/^bot:/d' | sed '/^\s*$/d' | head -c 4000)
+          echo "bot=$BOT" >> "$GITHUB_OUTPUT"
+          {
+            echo "task<<TASK_EOF"
+            echo "$TASK"
+            echo "TASK_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Routing issue #$NUM to bot '$BOT'"
+
+      - name: Mark issue in-progress
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" --repo "$REPO" \
+            --body "🤖 Dispatched to bot \`${{ steps.parse.outputs.bot }}\` — working on it now.
+          (run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+      - name: Dispatch to the fleet
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          HTTP_CODE=$(curl -s -m 540 -o /tmp/resp.json -w '%{http_code}' -X POST \
+            "${HERMES_URL%/}/v1/chat/completions" \
+            -H "Authorization: Bearer ${HERMES_KEY}" \
+            -H "Content-Type: application/json" \
+            --max-time 530 \
+            -d "$(jq -n --arg task "${{ steps.parse.outputs.task }}" \
+              '{model: ("hermes-" + "${{ steps.parse.outputs.bot }}"),
+                messages: [{role: "user", content: $task}]}')") || HTTP_CODE=000
+          [ "$HTTP_CODE" = "200" ] || {
+            echo "::error::Fleet dispatch returned HTTP $HTTP_CODE"
+            gh issue comment "${{ github.event.issue.number }}" --repo "$REPO" \
+              --body "❌ Dispatch failed (HTTP $HTTP_CODE). Re-add the \`task\` label to retry."
+            exit 1
+          }
+          CONTENT=$(jq -r '.choices[0].message.content' /tmp/resp.json)
+          {
+            echo "reply<<REPLY_EOF"
+            echo "$CONTENT"
+            echo "REPLY_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Deliver result + close
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" --repo "$REPO" \
+            --body "✅ **Bot \`${{ steps.parse.outputs.bot }}\` completed this task:**
+
+          <details><summary>Reply</summary>
+
+          ${{ steps.run.outputs.reply }}
+
+          </details>
+
+          Closing as delivered. Reopen + re-label \`task\` if more work is needed."
+          gh issue close "${{ github.event.issue.number }}" --repo "$REPO" \
+            --reason completed
