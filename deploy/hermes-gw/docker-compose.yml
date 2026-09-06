@@ -45,5 +45,8 @@ services:
     environment:
       - HERMES_UID=${HERMES_UID:-1000}
       - HERMES_GID=${HERMES_GID:-1000}
+      - HERMES_DASHBOARD=1            # s6-supervised web dashboard backend (Desktop remote-gateway target)
+      - HERMES_DASHBOARD_HOST=0.0.0.0 # reachable via the sidecar's tailnet IP
+      - HERMES_DASHBOARD_PORT=9119
     volumes:
       - ./data:/opt/data           # config.yaml, .env, profiles/, sessions, memory
