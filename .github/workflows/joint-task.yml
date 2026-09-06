@@ -40,11 +40,11 @@ jobs:
           echo "HTTP $HTTP_CODE"
           [ "$HTTP_CODE" -lt 400 ] || { cat /tmp/resp.json; exit 1; }
 
-          # extract the reply and encode for safe cross-job transfer
-          jq -r '.choices[0].message.content' /tmp/resp.json > dataset.md
+          # extract the reply and strip model code-fences for a clean CSV
+          jq -r '.choices[0].message.content' /tmp/resp.json | sed '/^```/d' > dataset.csv
           echo "--- dataset (first 400 chars) ---"
-          head -c 400 dataset.md
-          B64=$(base64 -w0 dataset.md)
+          head -c 400 dataset.csv
+          B64=$(base64 -w0 dataset.csv)
           echo "dataset_b64=$B64" >> "$GITHUB_OUTPUT"
 
   parse:
@@ -111,7 +111,9 @@ jobs:
             echo ""
             echo "## Dataset (generated on tasker-p1)"
             echo ""
+            echo '```csv'
             echo "${{ needs.generate.outputs.dataset_b64 }}" | base64 -d
+            echo '```'
             echo ""
             echo "## Analysis (parsed on designlab1)"
             echo ""
