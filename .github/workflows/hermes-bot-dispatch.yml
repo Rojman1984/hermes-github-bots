@@ -20,6 +20,8 @@ on:
 env:
   HERMES_URL: ${{ secrets.HERMES_API_URL }}
   HERMES_KEY: ${{ secrets.HERMES_API_KEY }}
+  SCOUT_KEY: ${{ secrets.SCOUT_API_KEY }}
+  SCRIBE_KEY: ${{ secrets.SCRIBE_API_KEY }}
   BOT_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
   REPO: Rojman1984/hermes-github-bots
 
@@ -48,6 +50,16 @@ jobs:
             TASK="${RELAY_PREFIX} ${TASK}"
           fi
 
+          # model-tier routing: named worker bots run LOCAL models via their own
+          # multiplexed profile endpoints; default/orchestrator stays on cloud.
+          case "$BOT" in
+            scout)   ROUTE="/p/scout";  BOTKEY="$SCOUT_KEY"  ;;
+            scribe)  ROUTE="/p/scribe"; BOTKEY="$SCRIBE_KEY" ;;
+            *)       ROUTE="";          BOTKEY="$HERMES_KEY" ;;
+          esac
+          [ -n "$BOTKEY" ] || { echo "::error::No API key for bot '$BOT'"; exit 1; }
+          echo "routing bot '$BOT' -> ${ROUTE:-/} (local-tier: $([ -n "$ROUTE" ] && echo yes || echo no))"
+
           jq -n \
             --arg bot "$BOT" \
             --arg task "$TASK" \
@@ -60,8 +72,8 @@ jobs:
               hermes_run_url: $run_url}' > payload.json
 
           HTTP_CODE=$(curl -s -o /tmp/resp.txt -w '%{http_code}' -X POST \
-            "${HERMES_URL%/}/v1/chat/completions" \
-            -H "Authorization: Bearer ${HERMES_KEY}" \
+            "${HERMES_URL%/}${ROUTE}/v1/chat/completions" \
+            -H "Authorization: Bearer ${BOTKEY}" \
             -H "X-Hermes-Session-Id: fleet-${BOT}" \
             -H "Content-Type: application/json" \
             --max-time 540 \
@@ -109,11 +121,16 @@ jobs:
             TT=$(jq -r '.usage.total_tokens // 0' /tmp/fleetlog/api_meta.json)
             # provider/model ground truth: session id is ours by construction
             SID="fleet-${BOT}"
-            SESSION_JSON=$(curl -s -m 20 "${HERMES_URL%/}/api/sessions/$SID" \
-              -H "Authorization: Bearer ${HERMES_KEY}" || echo '{}')
+            SESSION_JSON=$(curl -s -m 20 "${HERMES_URL%/}${ROUTE}/api/sessions/$SID" \
+              -H "Authorization: Bearer ${BOTKEY}" || echo '{}')
             SMODEL=$(echo "$SESSION_JSON" | jq -r '.session.model // "unknown"')
-            SPROVIDER="custom"
-            SBASEURL="https://ollama.com/v1"
+            if [ -n "$ROUTE" ]; then
+              SPROVIDER="ollama-local"
+              SBASEURL="http://172.24.0.1:11434/v1 (tasker-p1 iGPU)"
+            else
+              SPROVIDER="custom"
+              SBASEURL="https://ollama.com/v1"
+            fi
 
             F="logs/dispatches/$DAY/run-$RUN.md"
             mkdir -p "$(dirname "$F")"
