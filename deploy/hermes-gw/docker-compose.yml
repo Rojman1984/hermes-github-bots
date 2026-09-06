@@ -38,6 +38,7 @@ services:
     image: ${HERMES_IMAGE:-nousresearch/hermes-agent:latest}
     container_name: hermes-gw
     restart: unless-stopped
+    command: ["gateway", "run"]    # gateway mode (not the default chat REPL)
     mem_limit: 4g
     cpus: 2
     network_mode: "service:ts"     # share ts's netns so funnel reaches 127.0.0.1:8642/8644
