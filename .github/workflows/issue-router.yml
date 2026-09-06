@@ -49,7 +49,7 @@ jobs:
           NUM="${{ github.event.issue.number }}"
           BODY=$(gh issue view "$NUM" --repo "$REPO" --json body -q .body)
           # first line starting with "bot:" names the profile; default otherwise
-          BOT=$(echo "$BODY" | grep -m1 -oE '^bot:[[:alnum:]_-]+' | cut -d: -f2 || true)
+          BOT=$(echo "$BODY" | grep -m1 -oE '^bot:[[:alnum:]_-]+' | cut -d: -f2 | xargs || true)
           [ -n "$BOT" ] || BOT=default
           # strip any leading directive lines to form the task text
           TASK=$(echo "$BODY" | sed '/^bot:/d' | sed '/^\s*$/d' | head -c 6000)
