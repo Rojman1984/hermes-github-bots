@@ -76,13 +76,14 @@ jobs:
           echo "--- bot reply (first 500 chars) ---"
           head -c 500 /tmp/reply.md
 
-          # stash for the recorder step
+          # stash for the recorder step (shell-built JSON — no jq key quirks)
           mkdir -p /tmp/fleetlog
           cp /tmp/reply.md /tmp/fleetlog/reply.md
           cp payload.json   /tmp/fleetlog/payload.json
-          jq -c '{bot: $bot, machine: $machine, task: $task}' \
-            --arg bot "$BOT" --arg machine "$MACHINE" --arg task "$TASK" \
-            > /tmp/fleetlog/meta.json
+          jq -c '{model, usage}' /tmp/resp.txt > /tmp/fleetlog/api_meta.json
+          printf '{"bot":"%s","machine":"%s","task":%s}\n' \
+            "$BOT" "$MACHINE" "$(jq -Rsa . <<<"$TASK")" > /tmp/fleetlog/meta.json
+          echo "--- meta.json ---"; cat /tmp/fleetlog/meta.json | head -c 300; echo
 
       - name: Record reply + usage to the repo
         if: success()
@@ -102,13 +103,13 @@ jobs:
 
             DAY=$(date -u +%F); NOW=$(date -u +%FT%TZ)
             RUN="${{ github.run_id }}"
-            BOT=$(jq -r .bot  /tmp/fleetlog/meta.json)
-            MACHINE=$(jq -r .machine /tmp/fleetlog/meta.json)
-            TASK=$(jq -r .task /tmp/fleetlog/meta.json)
-            MODEL=$(jq -r '.model // "n/a"' /tmp/resp.txt)
-            PT=$(jq -r '.usage.prompt_tokens // 0' /tmp/resp.txt)
-            CT=$(jq -r '.usage.completion_tokens // 0' /tmp/resp.txt)
-            TT=$(jq -r '.usage.total_tokens // 0' /tmp/resp.txt)
+            BOT=$(jq -r '.bot // ""' /tmp/fleetlog/meta.json)
+            MACHINE=$(jq -r '.machine // ""' /tmp/fleetlog/meta.json)
+            TASK=$(jq -r '.task // ""' /tmp/fleetlog/meta.json)
+            MODEL=$(jq -r '.model // "n/a"' /tmp/fleetlog/api_meta.json)
+            PT=$(jq -r '.usage.prompt_tokens // 0' /tmp/fleetlog/api_meta.json)
+            CT=$(jq -r '.usage.completion_tokens // 0' /tmp/fleetlog/api_meta.json)
+            TT=$(jq -r '.usage.total_tokens // 0' /tmp/fleetlog/api_meta.json)
 
             # 1. human-readable log
             F="logs/dispatches/$DAY/run-$RUN.md"
