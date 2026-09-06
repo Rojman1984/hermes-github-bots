@@ -59,7 +59,7 @@ jobs:
         id: parse
         run: |
           set -euo pipefail
-          echo "${{ needs.generate.outputs.dataset_b64 }}" | base64 -d > dataset.md
+          echo "${{ needs.generate.outputs.dataset_b64 }}" | base64 -d > dataset.csv
 
           # relay wrapper: the tasker-p1 gateway forwards this to designlab1
           TASK="[PEER-RELAY to designlab1] Deliver this task by running EXACTLY this shell command from inside your gateway host: hermes peer dm designlab1 < /dev/stdin — with the task text below on stdin. IMPORTANT: do NOT parse or answer the task yourself; the reply from the peer is the deliverable. After sending, report: (1) the literal line RELAY_STATUS=OK or RELAY_STATUS=FAILED, then (2) the peer's reply verbatim. Task for designlab1: Parse the following CSV dataset. Compute: total row count, count per category, min/max/mean of the value column. Then write a 3-bullet insight summary. Reply with a markdown report only.
