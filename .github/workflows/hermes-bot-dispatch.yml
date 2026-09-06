@@ -120,7 +120,7 @@ jobs:
             CT=$(jq -r '.usage.completion_tokens // 0' /tmp/fleetlog/api_meta.json)
             TT=$(jq -r '.usage.total_tokens // 0' /tmp/fleetlog/api_meta.json)
             # provider/model ground truth: session id is ours by construction
-            SID="fleet-${BOT}"
+            SID="fleet-${BOT}${ROUTE:+-local}"
             # re-derive routing in this step (ROUTE/BOTKEY live in step 1's shell)
             case "$BOT" in
               scout)  ROUTE="/p/scout";  BOTKEY="$SCOUT_KEY"  ;;
