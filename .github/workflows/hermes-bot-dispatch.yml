@@ -82,7 +82,7 @@ jobs:
           cp payload.json   /tmp/fleetlog/payload.json
           jq -c '{bot: $bot, machine: $machine, task: $task}' \
             --arg bot "$BOT" --arg machine "$MACHINE" --arg task "$TASK" \
-            '{bot, machine, task}' > /tmp/fleetlog/meta.json
+            > /tmp/fleetlog/meta.json
 
       - name: Record reply + usage to the repo
         if: success()
