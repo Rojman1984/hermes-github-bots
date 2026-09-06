@@ -59,6 +59,8 @@ jobs:
 
       - name: Ping tier — endpoints + recent runs
         if: steps.tier.outputs.mode == 'ping'
+        env:
+          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           FAIL=""
