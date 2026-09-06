@@ -70,9 +70,12 @@ jobs:
           # 2. Webhook surface through the funnel
           W=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$HERMES_URL/health" || echo 000)
           [ "$W" = "200" ] || FAIL="$FAIL webhook-health=$W"
-          # 3. Recent Actions runs — a farm of failures is an incident even if pings pass
-          RECENT=$(gh run list --repo "$REPO" --limit 10 --json conclusion \
-            -q '[.[].conclusion] | map(select(. == "failure")) | length')
+          # 3. Recent Actions runs — a farm of failures is an incident even if pings pass.
+          # Only count the last 60 minutes and exclude workflow_dispatch (debug runs
+          # fired by a human don't indicate fleet trouble).
+          SINCE=$(date -u -d '60 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+          RECENT=$(gh run list --repo "$REPO" --limit 20 --created ">$SINCE" --json conclusion,event \
+            -q '[.[] | select(.event != "workflow_dispatch") | .conclusion] | map(select(. == "failure")) | length')
           [ "$RECENT" -le 2 ] || FAIL="$FAIL recent-failures=$RECENT"
           if [ -n "$FAIL" ]; then
             echo "::error::Ping tier FAILED:$FAIL"
@@ -104,8 +107,12 @@ jobs:
 
       - name: File or update incident issue
         if: failure()
+        # NOTE: github.token, not the bot PAT — the fine-grained PAT lacks the
+        # Labels permission, so `--label` gets silently dropped at issue create
+        # and addLabelsToLabelable 403s (proven 2026-09-06). Workflow token has
+        # issues:write via the permissions block.
         env:
-          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           REASON=$(cat /tmp/sentinel-failure.txt 2>/dev/null || echo "unknown failure")
@@ -130,8 +137,9 @@ jobs:
 
       - name: Auto-close healthy incident
         if: success() && steps.tier.outputs.mode == 'deep'
+        # github.token: same Labels permission reason as the incident step
         env:
-          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           NUM=$(gh issue list --repo "$REPO" --label "$INCIDENT_LABEL" --state open \
