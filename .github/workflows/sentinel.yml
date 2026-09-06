@@ -57,6 +57,14 @@ jobs:
             echo "mode=ping" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Incident drill (forces the failure path; tests issue filing)
+        if: steps.tier.outputs.mode == 'drill'
+        run: |
+          set -euo pipefail
+          echo "DRILL_FAILED: deliberate drill (tier=drill), no real fault" >> /tmp/sentinel-failure.txt
+          echo "::warning::Incident drill — this failure is deliberate"
+          exit 1
+
       - name: Ping tier — endpoints + recent runs
         if: steps.tier.outputs.mode == 'ping'
         env:
