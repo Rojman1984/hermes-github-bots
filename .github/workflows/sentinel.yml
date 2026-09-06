@@ -144,6 +144,10 @@ jobs:
             fi
           fi
 
+      - name: Checkout for status PR
+        if: success() && steps.tier.outputs.mode == 'deep'
+        uses: actions/checkout@v4
+
       - name: Daily status PR (deep tier, success only)
         if: success() && steps.tier.outputs.mode == 'deep'
         env:
