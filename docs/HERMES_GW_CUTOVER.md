@@ -1,5 +1,9 @@
 # hermes-gw Cutover Runbook
 
+> **CUT OVER LIVE 2026-09-06** — see "As-built notes" at the bottom for the
+> deviations from the original plan (all verified: brain probe, signed
+> callback, live dispatch through the container).
+
 Move the production gateway from the native systemd service on tasker-p1 to
 the containerized `hermes-gw` stack (`deploy/hermes-gw/docker-compose.yml`).
 
@@ -84,3 +88,23 @@ docker exec -it hermes-gw hermes setup --portal   # auth token persists in /opt/
 Profiles are created normally (`hermes profile create scout` …) — the official
 image supervises each profile as its own s6 service with per-profile logs.
 Never run a second gateway container against the same ./data.
+## As-built notes (2026-09-06, live)
+
+Deviations from the plan above, all verified in production:
+
+1. **`command: ["gateway", "run"]` is required** in compose — without it the
+   official image boots an interactive chat REPL and the funnel 502s.
+2. **The container brain uses Ollama's CLOUD API**, not the host Ollama:
+   `providers.custom = {base_url: https://ollama.com/v1, api_key: <key>}`,
+   `model = {provider: custom, default: glm-5.2:cloud}` in data/config.yaml.
+   Loopback (host Ollama at 127.0.0.1:11434) is unreachable from the sidecar
+   netns by design — cloud API removes the host dependency entirely and makes
+   the stack fully portable. (HMAC gotcha: `openssl dgst -r` prints
+   `HASH *stdin` — the hash is field **1**, not 2.)
+3. **Copy the data dir with the stack's gw STOPPED**, exclude gateway.lock /
+   gateway.log, chown to the compose uid. ~3.2 GB.
+4. Post-migration one-shots inside the container:
+   `hermes config set platforms.webhook.enabled true` + `hermes gateway restart`.
+5. Native systemd gateway on tasker-p1 is **disabled** (not removed) — data
+   kept at ~/.hermes for the 7-day rollback window. designlab1 stays a
+   tailnet-only peer.
