@@ -62,10 +62,10 @@ jobs:
           echo "${{ needs.generate.outputs.dataset_b64 }}" | base64 -d > dataset.md
 
           # relay wrapper: the tasker-p1 gateway forwards this to designlab1
-          TASK="[PEER-RELAY to designlab1] Deliver this task to the designlab1 machine (hermes peer dm designlab1, or message_agent target=designlab1), wait for its reply, and report that reply verbatim as your answer. Task: Parse the following CSV dataset. Compute: total row count, count per category, min/max/mean of the value column. Then write a 3-bullet insight summary. Reply with a markdown report only.
+          TASK="[PEER-RELAY to designlab1] Deliver this task by running EXACTLY this shell command from inside your gateway host: hermes peer dm designlab1 < /dev/stdin — with the task text below on stdin. IMPORTANT: do NOT parse or answer the task yourself; the reply from the peer is the deliverable. After sending, report: (1) the literal line RELAY_STATUS=OK or RELAY_STATUS=FAILED, then (2) the peer's reply verbatim. Task for designlab1: Parse the following CSV dataset. Compute: total row count, count per category, min/max/mean of the value column. Then write a 3-bullet insight summary. Reply with a markdown report only.
 
           ${{ github.event.inputs.topic }} dataset:
-          $(cat dataset.md)"
+          $(cat dataset.csv)"
 
           HTTP_CODE=$(curl -s -o /tmp/resp.json -w '%{http_code}' -X POST \
             "${HERMES_URL%/}/v1/chat/completions" \
@@ -78,6 +78,12 @@ jobs:
           [ "$HTTP_CODE" -lt 400 ] || { cat /tmp/resp.json; exit 1; }
 
           jq -r '.choices[0].message.content' /tmp/resp.json > analysis.md
+          # fail loudly if the peer relay did not actually happen
+          grep -q "RELAY_STATUS=OK" analysis.md || {
+            echo "::error::Peer relay to designlab1 did not complete (no RELAY_STATUS=OK) — stage 2 silently substituted:"
+            head -c 300 analysis.md; exit 1; }
+          # strip the relay wrapper markers so the deliverable is clean
+          sed -i '/RELAY_STATUS=/d; /^\[PEER-RELAY/d' analysis.md
           echo "--- analysis (first 400 chars) ---"
           head -c 400 analysis.md
           B64=$(base64 -w0 analysis.md)
