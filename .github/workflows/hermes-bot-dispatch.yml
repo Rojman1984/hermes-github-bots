@@ -1,8 +1,11 @@
 name: Dispatch Hermes Bot
 
-# Fire-and-forget dispatch of a job to a Hermes Bot profile. The bot runs on
-# your machine (or any gateway reachable from it); this workflow only costs
-# ~1-2 Actions minutes to kick it off.
+# Dispatch a job to a Hermes Bot profile AND record the exchange:
+#   - reply + token usage  -> logs/dispatches/<UTC-day>/run-<id>.md   (human-readable)
+#   - token usage          -> data/usage/usage.jsonl                  (machine ledger)
+# Both are committed straight to main as hermes-bot[bot] (append-only logging;
+# ALLOWED_PATHS whitelists logs/ + data/). Every bot output is therefore
+# visible in the GitHub console: commits, files, and Actions logs.
 
 on:
   repository_dispatch:
@@ -15,8 +18,10 @@ on:
       deliver_to: { description: "Delivery target (bot-chat|all|platform:chat:id)", required: false, default: "" }
 
 env:
-  HERMES_URL: ${{ secrets.HERMES_API_URL }}     # e.g. http://your-host:8377
-  HERMES_KEY: ${{ secrets.HERMES_API_KEY }}     # API_SERVER_KEY
+  HERMES_URL: ${{ secrets.HERMES_API_URL }}
+  HERMES_KEY: ${{ secrets.HERMES_API_KEY }}
+  BOT_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+  REPO: Rojman1984/hermes-github-bots
 
 jobs:
   dispatch:
@@ -36,13 +41,10 @@ jobs:
           TASK="${{ github.event.inputs.task || github.event.client_payload.task || '' }}"
           DELIVER="${{ github.event.inputs.deliver_to || github.event.client_payload.deliver_to || '' }}"
 
-          if [ -z "$TASK" ]; then
-            echo "::error::No task provided."
-            exit 1
-          fi
+          [ -n "$TASK" ] || { echo "::error::No task provided."; exit 1; }
 
           if [ "$MACHINE" = "designlab1" ]; then
-            RELAY_PREFIX="[PEER-RELAY to designlab1] Deliver this task to the designlab1 machine (hermes peer dm designlab1, or message_agent target=designlab1), wait for its reply, and report that reply verbatim as your answer. Task:"
+            RELAY_PREFIX="[PEER-RELAY to designlab1] Deliver this task by running EXACTLY this shell command from inside your gateway host: hermes peer dm designlab1 < /dev/stdin — with the task text below on stdin. IMPORTANT: do NOT parse or answer the task yourself; the reply from the peer is the deliverable. After sending, report: (1) the literal line RELAY_STATUS=OK or RELAY_STATUS=FAILED, then (2) the peer's reply verbatim. Task:"
             TASK="${RELAY_PREFIX} ${TASK}"
           fi
 
@@ -64,8 +66,83 @@ jobs:
             -d @payload.json)
 
           echo "HTTP ${HTTP_CODE}"
-          head -c 2000 /tmp/resp.txt || true
           if [ "$HTTP_CODE" -ge 400 ]; then
             echo "::error::Hermes returned HTTP ${HTTP_CODE}"
+            cat /tmp/resp.txt || true
             exit 1
           fi
+
+          jq -r '.choices[0].message.content' /tmp/resp.txt > /tmp/reply.md
+          echo "--- bot reply (first 500 chars) ---"
+          head -c 500 /tmp/reply.md
+
+          # stash for the recorder step
+          mkdir -p /tmp/fleetlog
+          cp /tmp/reply.md /tmp/fleetlog/reply.md
+          cp payload.json   /tmp/fleetlog/payload.json
+          jq -c '{bot: $bot, machine: $machine, task: $task}' \
+            --arg bot "$BOT" --arg machine "$MACHINE" --arg task "$TASK" \
+            '{bot, machine, task}' > /tmp/fleetlog/meta.json
+
+      - name: Record reply + usage to the repo
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # retry loop: rebase and retry push if another run committed first
+          for ATTEMPT in 1 2 3; do
+            git config user.name  "hermes-bot[bot]"
+            git config user.email "hermes-bot@users.noreply.github.com"
+            git pull --rebase origin main >/dev/null 2>&1 || true
+
+            DAY=$(date -u +%F); NOW=$(date -u +%FT%TZ)
+            RUN="${{ github.run_id }}"
+            BOT=$(jq -r .bot  /tmp/fleetlog/meta.json)
+            MACHINE=$(jq -r .machine /tmp/fleetlog/meta.json)
+            TASK=$(jq -r .task /tmp/fleetlog/meta.json)
+            MODEL=$(jq -r '.model // "n/a"' /tmp/resp.txt)
+            PT=$(jq -r '.usage.prompt_tokens // 0' /tmp/resp.txt)
+            CT=$(jq -r '.usage.completion_tokens // 0' /tmp/resp.txt)
+            TT=$(jq -r '.usage.total_tokens // 0' /tmp/resp.txt)
+
+            # 1. human-readable log
+            F="logs/dispatches/$DAY/run-$RUN.md"
+            mkdir -p "$(dirname "$F")"
+            {
+              echo "# Dispatch run $RUN — bot \`$BOT\`"
+              echo ""
+              echo "| | |"
+              echo "|---|---|"
+              echo "| When | $NOW |"
+              echo "| Machine | $MACHINE |"
+              echo "| Tokens | prompt=$PT completion=$CT total=$TT |"
+              echo "| Run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/$RUN |"
+              echo ""
+              echo "## Task"
+              echo ""
+              echo "$TASK"
+              echo ""
+              echo "## Reply"
+              echo ""
+              cat /tmp/fleetlog/reply.md
+            } > "$F"
+
+            # 2. machine usage ledger (one JSON line per dispatch)
+            mkdir -p data/usage
+            jq -cn --arg ts "$NOW" --arg run "$RUN" --arg bot "$BOT" --arg machine "$MACHINE" \
+              --argjson pt "$PT" --argjson ct "$CT" --argjson tt "$TT" \
+              '{ts: $ts, run_id: $run, bot: $bot, machine: $machine,
+                prompt_tokens: $pt, completion_tokens: $ct, total_tokens: $tt}' \
+              >> data/usage/usage.jsonl
+
+            git add logs/dispatches data/usage
+            git commit -m "bot(dispatch): log run $RUN ($BOT, ${TT} tokens)" >/dev/null
+            if git push "https://x-access-token:${BOT_TOKEN}@github.com/${REPO}.git" HEAD:main >/dev/null 2>&1; then
+              echo "Recorded: $F (+usage ledger)"
+              break
+            fi
+            [ "$ATTEMPT" = "3" ] && { echo "::error::Could not push dispatch log after 3 attempts"; exit 1; }
+            echo "push race (attempt $ATTEMPT) — rebasing and retrying"
+            sleep 3
+          done
