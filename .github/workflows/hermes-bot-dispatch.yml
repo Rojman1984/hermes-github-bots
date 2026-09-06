@@ -1,184 +1,119 @@
 name: Dispatch Hermes Bot
-
-# Dispatch a job to a Hermes Bot profile AND record the exchange:
-#   - reply + token usage  -> logs/dispatches/<UTC-day>/run-<id>.md   (human-readable)
-#   - token usage          -> data/usage/usage.jsonl                  (machine ledger)
-# Both are committed straight to main as hermes-bot[bot] (append-only logging;
-# ALLOWED_PATHS whitelists logs/ + data/). Every bot output is therefore
-# visible in the GitHub console: commits, files, and Actions logs.
-
-on:
+true:
   repository_dispatch:
-    types: [hermes-bot-run]
+    types:
+    - hermes-bot-run
   workflow_dispatch:
     inputs:
-      bot:        { description: "Bot/profile name", required: true, default: "default" }
-      machine:    { description: "Target fleet: tasker-p1 (default) or designlab1 (relayed via peer)", required: false, default: "tasker-p1" }
-      task:       { description: "Task prompt for the bot", required: true }
-      deliver_to: { description: "Delivery target (bot-chat|all|platform:chat:id)", required: false, default: "" }
-
+      bot:
+        description: Bot/profile name
+        required: true
+        default: default
+      machine:
+        description: 'Target fleet: tasker-p1 (default) or designlab1 (relayed via
+          peer)'
+        required: false
+        default: tasker-p1
+      task:
+        description: Task prompt for the bot
+        required: true
+      deliver_to:
+        description: Delivery target (bot-chat|all|platform:chat:id)
+        required: false
+        default: ''
 env:
   HERMES_URL: ${{ secrets.HERMES_API_URL }}
   HERMES_KEY: ${{ secrets.HERMES_API_KEY }}
   BOT_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
   REPO: Rojman1984/hermes-github-bots
-
 jobs:
   dispatch:
     runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
-      - name: Dispatch to Hermes
-        run: |
-          set -euo pipefail
-          if [ -z "${HERMES_URL}" ] || [ -z "${HERMES_KEY}" ]; then
-            echo "::error::Set HERMES_API_URL and HERMES_API_KEY repo secrets first."
-            exit 1
-          fi
-
-          BOT="${{ github.event.inputs.bot || github.event.client_payload.bot || 'default' }}"
-          MACHINE="${{ github.event.inputs.machine || github.event.client_payload.machine || 'tasker-p1' }}"
-          TASK="${{ github.event.inputs.task || github.event.client_payload.task || '' }}"
-          DELIVER="${{ github.event.inputs.deliver_to || github.event.client_payload.deliver_to || '' }}"
-
-          [ -n "$TASK" ] || { echo "::error::No task provided."; exit 1; }
-
-          if [ "$MACHINE" = "designlab1" ]; then
-            RELAY_PREFIX="[PEER-RELAY to designlab1] Deliver this task by running EXACTLY this shell command from inside your gateway host: hermes peer dm designlab1 < /dev/stdin — with the task text below on stdin. IMPORTANT: do NOT parse or answer the task yourself; the reply from the peer is the deliverable. After sending, report: (1) the literal line RELAY_STATUS=OK or RELAY_STATUS=FAILED, then (2) the peer's reply verbatim. Task:"
-            TASK="${RELAY_PREFIX} ${TASK}"
-          fi
-
-          jq -n \
-            --arg bot "$BOT" \
-            --arg task "$TASK" \
-            --arg deliver "$DELIVER" \
-            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --arg log_url "${{ github.server_url }}/${{ github.repository }}/blob/main/logs/dispatches/$(date -u +%F)/run-${{ github.run_id }}.md" \
-            '{model: ("hermes-" + $bot),
-              messages: [{role: "user", content: ($task + "\n\n[GITHUB-CHECKPOINTS] run: " + $run_url + " | log (appears ~1 min after completion): " + $log_url)}],
-              hermes_deliver: (if $deliver == "" then null else $deliver end),
-              hermes_run_url: $run_url}' > payload.json
-
-          HTTP_CODE=$(curl -s -o /tmp/resp.txt -w '%{http_code}' -X POST \
-            "${HERMES_URL%/}/v1/chat/completions" \
-            -H "Authorization: Bearer ${HERMES_KEY}" \
-            -H "X-Hermes-Session-Id: fleet-${BOT}" \
-            -H "Content-Type: application/json" \
-            --max-time 540 \
-            -d @payload.json)
-
-          echo "HTTP ${HTTP_CODE}"
-          if [ "$HTTP_CODE" -ge 400 ]; then
-            echo "::error::Hermes returned HTTP ${HTTP_CODE}"
-            cat /tmp/resp.txt || true
-            exit 1
-          fi
-
-          jq -r '.choices[0].message.content' /tmp/resp.txt > /tmp/reply.md
-          echo "--- bot reply (first 500 chars) ---"
-          head -c 500 /tmp/reply.md
-
-          # stash for the recorder step (shell-built JSON — no jq key quirks)
-          mkdir -p /tmp/fleetlog
-          cp /tmp/reply.md /tmp/fleetlog/reply.md
-          cp payload.json   /tmp/fleetlog/payload.json
-          jq -c '{model, usage}' /tmp/resp.txt > /tmp/fleetlog/api_meta.json
-          printf '{"bot":"%s","machine":"%s","task":%s}\n' \
-            "$BOT" "$MACHINE" "$(jq -Rsa . <<<"$TASK")" > /tmp/fleetlog/meta.json
-          echo "--- meta.json ---"; cat /tmp/fleetlog/meta.json | head -c 300; echo
-
-      - name: Record reply + usage to the repo
-        if: success()
-        env:
-          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          git init -q /tmp/fleetrepo
-          cd /tmp/fleetrepo
-          git config user.name  "hermes-bot[bot]"
-          git config user.email "hermes-bot@users.noreply.github.com"
-          # retry loop: pull-rebase and retry push if another run committed first
-          for ATTEMPT in 1 2 3; do
-            git remote add origin "https://x-access-token:${BOT_TOKEN}@github.com/${REPO}.git" 2>/dev/null || true
-            git fetch -q origin main 2>/dev/null || { echo "::error::fetch failed"; exit 1; }
-            git checkout -q -b work origin/main
-
-            RUN="${{ github.run_id }}"
-            BOT=$(jq -r '.bot // ""' /tmp/fleetlog/meta.json)
-            MACHINE=$(jq -r '.machine // ""' /tmp/fleetlog/meta.json)
-            TASK=$(jq -r '.task // ""' /tmp/fleetlog/meta.json)
-            MODEL=$(jq -r '.model // "n/a"' /tmp/fleetlog/api_meta.json)
-            PT=$(jq -r '.usage.prompt_tokens // 0' /tmp/fleetlog/api_meta.json)
-            CT=$(jq -r '.usage.completion_tokens // 0' /tmp/fleetlog/api_meta.json)
-            TT=$(jq -r '.usage.total_tokens // 0' /tmp/fleetlog/api_meta.json)
-            # provider/model ground truth (from the gateway session API)
-            SID=$(jq -r '.id // "fleet-\($bot)"' --arg bot "$BOT" /tmp/resp.txt 2>/dev/null || echo "fleet-$BOT")
-            [ -n "$SID" ] || SID="fleet-$BOT"
-            SESSION_JSON=$(curl -s -m 20 "${HERMES_URL%/}/api/sessions/$SID" \
-              -H "Authorization: Bearer ${HERMES_KEY}" || echo '{}')
-            SMODEL=$(echo "$SESSION_JSON" | jq -r '.session.model // ""')
-            SPROVIDER="custom"            # hermes-gw stack provider (deploy/hermes-gw)
-            SBASEURL="https://ollama.com/v1"
-                        BOT=$(jq -r '.bot // ""' /tmp/fleetlog/meta.json)
-                        MACHINE=$(jq -r '.machine // ""' /tmp/fleetlog/meta.json)
-                        TASK=$(jq -r '.task // ""' /tmp/fleetlog/meta.json)
-                        MODEL=$(jq -r '.model // "n/a"' /tmp/fleetlog/api_meta.json)
-                        PT=$(jq -r '.usage.prompt_tokens // 0' /tmp/fleetlog/api_meta.json)
-                        CT=$(jq -r '.usage.completion_tokens // 0' /tmp/fleetlog/api_meta.json)
-                        TT=$(jq -r '.usage.total_tokens // 0' /tmp/fleetlog/api_meta.json)
-                        # provider/model ground truth (from the gateway session API)
-                        SID=$(jq -r '.id // "fleet-\\($bot)"' --arg bot "$BOT" /tmp/resp.txt 2>/dev/null || echo "fleet-$BOT")
-                        [ -n "$SID" ] || SID="fleet-$BOT"
-                        SESSION_JSON=$(curl -s -m 20 "${HERMES_URL%/}/api/sessions/$SID" \
-                          -H "Authorization: Bearer ${HERMES_KEY}" || echo '{}')
-                        SMODEL=$(echo "$SESSION_JSON" | jq -r '.session.model // ""')
-                        SPROVIDER="custom"            # hermes-gw stack provider (deploy/hermes-gw)
-                        SBASEURL="https://ollama.com/v1"
-
-
-            # 1. human-readable log
-            F="logs/dispatches/$DAY/run-$RUN.md"
-            mkdir -p "$(dirname "$F")"
-            {
-              echo "# Dispatch run $RUN — bot \`$BOT\`"
-              echo ""
-              echo "| | |"
-              echo "|---|---|"
-              echo "| When | $NOW |"
-              echo "| Machine | $MACHINE |"
-              echo "| Model | $SMODEL |"
-              echo "| Provider | $SPROVIDER ($SBASEURL) |"
-              echo "| Tokens | prompt=$PT completion=$CT total=$TT |"
-              echo "| Run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/$RUN |"
-              echo ""
-              echo "## Task"
-              echo ""
-              echo "$TASK"
-              echo ""
-              echo "## Reply"
-              echo ""
-              cat /tmp/fleetlog/reply.md
-            } > "$F"
-
-            # 2. machine usage ledger (one JSON line per dispatch)
-            mkdir -p data/usage
-            jq -cn --arg ts "$NOW" --arg run "$RUN" --arg bot "$BOT" --arg machine "$MACHINE" \
-              --arg model "$SMODEL" --arg provider "$SPROVIDER" --arg base_url "$SBASEURL" \
-              --arg sid "$SID" \
-              --argjson pt "$PT" --argjson ct "$CT" --argjson tt "$TT" \
-              '{ts: $ts, run_id: $run, bot: $bot, machine: $machine,
-                model: $model, provider: $provider, base_url: $base_url,
-                session_id: $sid,
-                prompt_tokens: $pt, completion_tokens: $ct, total_tokens: $tt}' \
-              >> data/usage/usage.jsonl
-
-            git add logs/dispatches data/usage
-            git commit -m "bot(dispatch): log run $RUN ($BOT, ${TT} tokens)" >/dev/null
-            if git push -q origin HEAD:main 2>/dev/null; then
-              echo "Recorded: $F (+usage ledger)"
-              break
-            fi
-            [ "$ATTEMPT" = "3" ] && { echo "::error::Could not push dispatch log after 3 attempts"; exit 1; }
-            echo "push race (attempt $ATTEMPT) — rebasing and retrying"
-            sleep 3
-          done
+    - name: Dispatch to Hermes
+      run: "set -euo pipefail\nif [ -z \"${HERMES_URL}\" ] || [ -z \"${HERMES_KEY}\"\
+        \ ]; then\n  echo \"::error::Set HERMES_API_URL and HERMES_API_KEY repo secrets\
+        \ first.\"\n  exit 1\nfi\n\nBOT=\"${{ github.event.inputs.bot || github.event.client_payload.bot\
+        \ || 'default' }}\"\nMACHINE=\"${{ github.event.inputs.machine || github.event.client_payload.machine\
+        \ || 'tasker-p1' }}\"\nTASK=\"${{ github.event.inputs.task || github.event.client_payload.task\
+        \ || '' }}\"\nDELIVER=\"${{ github.event.inputs.deliver_to || github.event.client_payload.deliver_to\
+        \ || '' }}\"\n\n[ -n \"$TASK\" ] || { echo \"::error::No task provided.\"\
+        ; exit 1; }\n\nif [ \"$MACHINE\" = \"designlab1\" ]; then\n  RELAY_PREFIX=\"\
+        [PEER-RELAY to designlab1] Deliver this task by running EXACTLY this shell\
+        \ command from inside your gateway host: hermes peer dm designlab1 < /dev/stdin\
+        \ — with the task text below on stdin. IMPORTANT: do NOT parse or answer the\
+        \ task yourself; the reply from the peer is the deliverable. After sending,\
+        \ report: (1) the literal line RELAY_STATUS=OK or RELAY_STATUS=FAILED, then\
+        \ (2) the peer's reply verbatim. Task:\"\n  TASK=\"${RELAY_PREFIX} ${TASK}\"\
+        \nfi\n\njq -n \\\n  --arg bot \"$BOT\" \\\n  --arg task \"$TASK\" \\\n  --arg\
+        \ deliver \"$DELIVER\" \\\n  --arg run_url \"${{ github.server_url }}/${{\
+        \ github.repository }}/actions/runs/${{ github.run_id }}\" \\\n  --arg log_url\
+        \ \"${{ github.server_url }}/${{ github.repository }}/blob/main/logs/dispatches/$(date\
+        \ -u +%F)/run-${{ github.run_id }}.md\" \\\n  '{model: (\"hermes-\" + $bot),\n\
+        \    messages: [{role: \"user\", content: ($task + \"\\n\\n[GITHUB-CHECKPOINTS]\
+        \ run: \" + $run_url + \" | log (appears ~1 min after completion): \" + $log_url)}],\n\
+        \    hermes_deliver: (if $deliver == \"\" then null else $deliver end),\n\
+        \    hermes_run_url: $run_url}' > payload.json\n\nHTTP_CODE=$(curl -s -o /tmp/resp.txt\
+        \ -w '%{http_code}' -X POST \\\n  \"${HERMES_URL%/}/v1/chat/completions\"\
+        \ \\\n  -H \"Authorization: Bearer ${HERMES_KEY}\" \\\n  -H \"X-Hermes-Session-Id:\
+        \ fleet-${BOT}\" \\\n  -H \"Content-Type: application/json\" \\\n  --max-time\
+        \ 540 \\\n  -d @payload.json)\n\necho \"HTTP ${HTTP_CODE}\"\nif [ \"$HTTP_CODE\"\
+        \ -ge 400 ]; then\n  echo \"::error::Hermes returned HTTP ${HTTP_CODE}\"\n\
+        \  cat /tmp/resp.txt || true\n  exit 1\nfi\n\njq -r '.choices[0].message.content'\
+        \ /tmp/resp.txt > /tmp/reply.md\necho \"--- bot reply (first 500 chars) ---\"\
+        \nhead -c 500 /tmp/reply.md\n\n# stash for the recorder step (shell-built\
+        \ JSON — no jq key quirks)\nmkdir -p /tmp/fleetlog\ncp /tmp/reply.md /tmp/fleetlog/reply.md\n\
+        cp payload.json   /tmp/fleetlog/payload.json\njq -c '{model, usage}' /tmp/resp.txt\
+        \ > /tmp/fleetlog/api_meta.json\nprintf '{\"bot\":\"%s\",\"machine\":\"%s\"\
+        ,\"task\":%s}\\n' \\\n  \"$BOT\" \"$MACHINE\" \"$(jq -Rsa . <<<\"$TASK\")\"\
+        \ > /tmp/fleetlog/meta.json\necho \"--- meta.json ---\"; cat /tmp/fleetlog/meta.json\
+        \ | head -c 300; echo\n"
+    - name: Record reply + usage to the repo
+      if: success()
+      env:
+        GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+      run: "set -euo pipefail\ngit init -q /tmp/fleetrepo\ncd /tmp/fleetrepo\ngit\
+        \ config user.name  \"hermes-bot[bot]\"\ngit config user.email \"hermes-bot@users.noreply.github.com\"\
+        \n# retry loop: pull-rebase and retry push if another run committed first\n\
+        for ATTEMPT in 1 2 3; do\n  git remote add origin \"https://x-access-token:${BOT_TOKEN}@github.com/${REPO}.git\"\
+        \ 2>/dev/null || true\n  git fetch -q origin main 2>/dev/null || { echo \"\
+        ::error::fetch failed\"; exit 1; }\n  git checkout -q -b work origin/main\n\
+        \n  DAY=$(date -u +%F); NOW=$(date -u +%FT%TZ)\n  RUN=\"${{ github.run_id\
+        \ }}\"\n  BOT=$(jq -r '.bot // \"\"' /tmp/fleetlog/meta.json)\n  MACHINE=$(jq\
+        \ -r '.machine // \"\"' /tmp/fleetlog/meta.json)\n  TASK=$(jq -r '.task //\
+        \ \"\"' /tmp/fleetlog/meta.json)\n  MODEL=$(jq -r '.model // \"n/a\"' /tmp/fleetlog/api_meta.json)\n\
+        \  PT=$(jq -r '.usage.prompt_tokens // 0' /tmp/fleetlog/api_meta.json)\n \
+        \ CT=$(jq -r '.usage.completion_tokens // 0' /tmp/fleetlog/api_meta.json)\n\
+        \  TT=$(jq -r '.usage.total_tokens // 0' /tmp/fleetlog/api_meta.json)\n  #\
+        \ provider/model ground truth (from the gateway session API)\n  SID=$(jq -r\
+        \ '.id // \"fleet-\\($bot)\"' --arg bot \"$BOT\" /tmp/resp.txt 2>/dev/null\
+        \ || echo \"fleet-$BOT\")\n  [ -n \"$SID\" ] || SID=\"fleet-$BOT\"\n  SESSION_JSON=$(curl\
+        \ -s -m 20 \"${HERMES_URL%/}/api/sessions/$SID\" \\\n    -H \"Authorization:\
+        \ Bearer ${HERMES_KEY}\" || echo '{}')\n  SMODEL=$(echo \"$SESSION_JSON\"\
+        \ | jq -r '.session.model // \"\"')\n  SPROVIDER=\"custom\"            # hermes-gw\
+        \ stack provider (deploy/hermes-gw)\n  SBASEURL=\"https://ollama.com/v1\"\n\
+        \n  # 1. human-readable log\n  F=\"logs/dispatches/$DAY/run-$RUN.md\"\n  mkdir\
+        \ -p \"$(dirname \"$F\")\"\n  {\n    echo \"# Dispatch run $RUN — bot \\`$BOT\\\
+        `\"\n    echo \"\"\n    echo \"| | |\"\n    echo \"|---|---|\"\n    echo \"\
+        | When | $NOW |\"\n    echo \"| Machine | $MACHINE |\"\n    echo \"| Model\
+        \ | $SMODEL |\"\n    echo \"| Provider | $SPROVIDER ($SBASEURL) |\"\n    echo\
+        \ \"| Tokens | prompt=$PT completion=$CT total=$TT |\"\n    echo \"| Run |\
+        \ ${{ github.server_url }}/${{ github.repository }}/actions/runs/$RUN |\"\n\
+        \    echo \"\"\n    echo \"## Task\"\n    echo \"\"\n    echo \"$TASK\"\n\
+        \    echo \"\"\n    echo \"## Reply\"\n    echo \"\"\n    cat /tmp/fleetlog/reply.md\n\
+        \  } > \"$F\"\n\n  # 2. machine usage ledger (one JSON line per dispatch)\n\
+        \  mkdir -p data/usage\n  jq -cn --arg ts \"$NOW\" --arg run \"$RUN\" --arg\
+        \ bot \"$BOT\" --arg machine \"$MACHINE\" \\\n    --arg model \"$SMODEL\"\
+        \ --arg provider \"$SPROVIDER\" --arg base_url \"$SBASEURL\" \\\n    --arg\
+        \ sid \"$SID\" \\\n    --argjson pt \"$PT\" --argjson ct \"$CT\" --argjson\
+        \ tt \"$TT\" \\\n    '{ts: $ts, run_id: $run, bot: $bot, machine: $machine,\n\
+        \      model: $model, provider: $provider, base_url: $base_url,\n      session_id:\
+        \ $sid,\n      prompt_tokens: $pt, completion_tokens: $ct, total_tokens: $tt}'\
+        \ \\\n    >> data/usage/usage.jsonl\n\n  git add logs/dispatches data/usage\n\
+        \  git commit -m \"bot(dispatch): log run $RUN ($BOT, ${TT} tokens)\" >/dev/null\n\
+        \  if git push -q origin HEAD:main 2>/dev/null; then\n    echo \"Recorded:\
+        \ $F (+usage ledger)\"\n    break\n  fi\n  [ \"$ATTEMPT\" = \"3\" ] && { echo\
+        \ \"::error::Could not push dispatch log after 3 attempts\"; exit 1; }\n \
+        \ echo \"push race (attempt $ATTEMPT) — rebasing and retrying\"\n  sleep 3\n\
+        done"
