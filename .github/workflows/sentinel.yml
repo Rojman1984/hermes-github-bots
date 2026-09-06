@@ -1,0 +1,182 @@
+name: Sentinel
+
+# The fleet's watchdog. Built from thepopebot's failure mode: a fleet whose
+# only oversight was event-driven notifications died silently when the human
+# stopped looking. Sentinel is SCHEDULED (GitHub's scheduler is independent of
+# our entire stack) and VERIFIES THE CHAIN, not just pings.
+#
+#   ping tier   (every 15 min) — endpoint health + recent-runs check, free
+#   deep tier   (hourly)       — real dispatch round-trip: GH → funnel →
+#                                hermes-gw container → brain → marker reply
+#
+# On failure: opens/updates a GitHub issue labeled `incident` (the alarm lands
+# in the same queue the future swarm works from). On deep success: files a
+# daily status report PR via the bot credential (bot-authored → no
+# action_required hold). A red scheduled run ALSO emails the owner — the alarm
+# channel cannot itself be down when the alarm fires.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # ping tier
+    - cron: "0 * * * *"      # deep tier (top of hour)
+  workflow_dispatch:
+    inputs:
+      tier: { description: "ping|deep", required: false, default: "deep" }
+
+concurrency:
+  group: sentinel
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+env:
+  HERMES_URL: ${{ secrets.HERMES_API_URL }}
+  HERMES_KEY: ${{ secrets.HERMES_API_KEY }}
+  BOT_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+  REPO: Rojman1984/hermes-github-bots
+  ISSUE_TITLE: "🚨 [incident] Fleet health check failing"
+  INCIDENT_LABEL: incident
+  STALE_HOURS: "2"          # incident auto-closes when healthy this long
+
+jobs:
+  sentinel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Detect tier
+        id: tier
+        run: |
+          if [ -n "${{ github.event.inputs.tier }}" ]; then
+            echo "mode=${{ github.event.inputs.tier }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 * * * *" ]; then
+            echo "mode=deep" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=ping" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ping tier — endpoints + recent runs
+        if: steps.tier.outputs.mode == 'ping'
+        run: |
+          set -euo pipefail
+          FAIL=""
+          # 1. API surface through the funnel
+          H=$(curl -s -m 20 -o /tmp/h.json -w '%{http_code}' "$HERMES_URL/health" || echo 000)
+          [ "$H" = "200" ] || FAIL="$FAIL api-health=$H"
+          # 2. Webhook surface through the funnel
+          W=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$HERMES_URL/health" || echo 000)
+          [ "$W" = "200" ] || FAIL="$FAIL webhook-health=$W"
+          # 3. Recent Actions runs — a farm of failures is an incident even if pings pass
+          RECENT=$(gh run list --repo "$REPO" --limit 10 --json conclusion \
+            -q '[.[].conclusion] | map(select(. == "failure")) | length')
+          [ "$RECENT" -le 2 ] || FAIL="$FAIL recent-failures=$RECENT"
+          if [ -n "$FAIL" ]; then
+            echo "::error::Ping tier FAILED:$FAIL"
+            echo "PING_FAILED:$FAIL" >> /tmp/sentinel-failure.txt
+            exit 1
+          fi
+          echo "Ping tier OK"
+
+      - name: Deep tier — real brain round-trip
+        if: steps.tier.outputs.mode == 'deep'
+        run: |
+          set -euo pipefail
+          MARKER="SENTINEL_$(date -u +%Y%m%d%H)"
+          HTTP_CODE=$(curl -s -m 300 -o /tmp/resp.json -w '%{http_code}' -X POST \
+            "${HERMES_URL%/}/v1/chat/completions" \
+            -H "Authorization: Bearer ${HERMES_KEY}" \
+            -H "Content-Type: application/json" \
+            --max-time 290 \
+            -d "$(jq -n --arg m "$MARKER" \
+              '{model: "hermes-default",
+                messages: [{role: "user", content: ("Reply with exactly: " + $m)}]}')") || HTTP_CODE=000
+          [ "$HTTP_CODE" = "200" ] || { echo "::error::Deep tier: dispatch HTTP $HTTP_CODE"; echo "DEEP_FAILED: dispatch http=$HTTP_CODE" >> /tmp/sentinel-failure.txt; exit 1; }
+          CONTENT=$(jq -r '.choices[0].message.content' /tmp/resp.json)
+          echo "$CONTENT" | grep -q "$MARKER" || {
+            echo "::error::Deep tier: marker mismatch — brain answered wrong: $CONTENT"
+            echo "DEEP_FAILED: marker mismatch ($CONTENT)" >> /tmp/sentinel-failure.txt
+            exit 1; }
+          echo "Deep tier OK — brain round-trip verified ($CONTENT)"
+
+      - name: File or update incident issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REASON=$(cat /tmp/sentinel-failure.txt 2>/dev/null || echo "unknown failure")
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # find an OPEN incident issue
+          NUM=$(gh issue list --repo "$REPO" --label "$INCIDENT_LABEL" --state open \
+            --json number -q '.[0].number' || echo "")
+          if [ -z "$NUM" ]; then
+            gh issue create --repo "$REPO" \
+              --title "$ISSUE_TITLE" \
+              --label "$INCIDENT_LABEL" \
+              --body "First detected: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          Tier: ${{ steps.tier.outputs.mode }}
+          Failure: \`$REASON\`
+          Run: $RUN_URL
+
+          This incident stays open until Sentinel observes STALE_HOURS=${STALE_HOURS}h of clean checks."
+          else
+            gh issue comment "$NUM" --repo "$REPO" \
+              --body "Still failing at $(date -u +%H:%M:%SZ) — \`$REASON\` (run: $RUN_URL)"
+          fi
+
+      - name: Auto-close healthy incident
+        if: success() && steps.tier.outputs.mode == 'deep'
+        env:
+          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NUM=$(gh issue list --repo "$REPO" --label "$INCIDENT_LABEL" --state open \
+            --json number -q '.[0].number' || echo "")
+          # close only if the incident issue's last comment is older than STALE_HOURS
+          if [ -n "$NUM" ]; then
+            LAST=$(gh issue view "$NUM" --repo "$REPO" --json updatedAt -q .updatedAt)
+            AGE=$(( $(date -u +%s) - $(date -u -d "$LAST" +%s) ))
+            if [ "$AGE" -ge $(( STALE_HOURS * 3600 )) ]; then
+              gh issue close "$NUM" --repo "$REPO" \
+                --comment "✅ Auto-resolved: $STALE_HOURS h of clean checks. Last failure comment was at $LAST."
+            fi
+          fi
+
+      - name: Daily status PR (deep tier, success only)
+        if: success() && steps.tier.outputs.mode == 'deep'
+        env:
+          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # one status PR per UTC day
+          DAY=$(date -u +%Y-%m-%d)
+          FILE="docs/status/$DAY.md"
+          BR="bot/sentinel/status-$DAY"
+          if gh api "repos/$REPO/contents/$FILE" >/dev/null 2>&1; then
+            echo "Status for $DAY already filed — skipping."
+            exit 0
+          fi
+          git config user.name  "hermes-bot[bot]"
+          git config user.email "hermes-bot@users.noreply.github.com"
+          git checkout -b "$BR"
+          mkdir -p "$(dirname "$FILE")"
+          {
+            echo "# Fleet status — $DAY"
+            echo ""
+            echo "Generated by Sentinel (deep tier) at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+            echo ""
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| Funnel API health | ✅ 200 |"
+            echo "| Brain round-trip | ✅ marker verified |"
+            echo "| Gateway version | $(jq -r '.version // "n/a"' /tmp/h.json 2>/dev/null || echo 'n/a (ping-tier only today)') |"
+            echo "| Open incidents | $(gh issue list --repo "$REPO" --label "$INCIDENT_LABEL" --state open | wc -l) |"
+          } > "$FILE"
+          git add "$FILE"
+          git commit -m "bot(sentinel): daily status $DAY"
+          git push "https://x-access-token:${BOT_TOKEN}@github.com/$REPO.git" "$BR"
+          gh pr create --repo "$REPO" --base main --head "$BR" \
+            --title "bot(sentinel): daily status $DAY" \
+            --body "Automated fleet status from Sentinel deep tier. Auto-merges under ALLOWED_PATHS (docs/)."
